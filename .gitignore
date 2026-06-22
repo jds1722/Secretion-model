@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+.DS_Store
+.ipynb_checkpoints/
+*.log
+venv/
+env/
+*.sqlite3
+*.db
+*.h5
+*.pt
+*.pth
+data/raw/

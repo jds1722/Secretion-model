@@ -1,0 +1,26 @@
+seed: 17
+
+layers:
+  bf: 0
+  nucleus: 1
+  bead_ins: 5
+  bead_gcg: 7
+  ignore: [2, 3, 4, 6]
+
+preprocess:
+  lower_percentile: 0.5
+  upper_percentile: 99.5
+  bead_threshold_percentile: 99.0
+  bead_dilation_px: 3
+  fill_mode: median
+
+training:
+  image_size: 224
+  batch_size: 32
+  epochs: 40
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  val_fraction: 0.15
+  test_fraction: 0.15
+  num_workers: 4
+
