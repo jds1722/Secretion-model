@@ -9,6 +9,9 @@ __pycache__/
 *.log
 venv/
 env/
+.venv/
+.python/
+python-*.exe
 *.sqlite3
 *.db
 *.h5
