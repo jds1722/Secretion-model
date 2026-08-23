@@ -18,3 +18,8 @@ python-*.exe
 *.pt
 *.pth
 data/raw/
+data/
+runs/
+predictions*.csv
+.matplotlib/
+.streamlit-user/
