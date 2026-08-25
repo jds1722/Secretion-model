@@ -128,6 +128,68 @@ python -m streamlit run app.py
 The UI provides pages for data folder checks, manifest creation, training,
 evaluation plots, Grad-CAM preview images, and prediction CSV generation.
 
+## Independent Preprocessing and Training
+
+The optional v2 workflow freezes preprocessing into compressed NPZ tensors so
+model training never opens or reprocesses the source TIFF files.
+
+First create the usual source manifest, then preprocess it once:
+
+```bash
+python preprocess_dataset.py \
+  --manifest data/manifest.csv \
+  --output-dir data/preprocessed_v2 \
+  --roi-size 128 \
+  --bead-min-diameter 5 \
+  --bead-max-diameter 20 \
+  --bead-dilation-px 2 \
+  --nucleus-min-diameter 10 \
+  --nucleus-max-diameter 100 \
+  --cell-opening-px 4
+```
+
+This writes:
+
+```text
+data/preprocessed_v2/
+  preprocess_run_config.json
+  preprocess_qc_all.csv
+  preprocessed_manifest.csv
+  tensors/
+    <source>_<path-hash>.npz
+    <source>_<path-hash>.qc.json
+```
+
+The v2 preprocessing independently detects INS and GCG bead objects, declumps
+them, filters by equivalent diameter, dilates and combines their masks, applies
+nucleus diameter/border QC, morphologically cleans the cell mask, and records
+blur, saturation, cell/nucleus ratio, border contact, ROI size, and object
+counts. Add `--fail-on-qc` to exclude samples without a valid nucleus from the
+trainable manifest while retaining every result in `preprocess_qc_all.csv`.
+
+Train only from those frozen tensors with the separate entry point:
+
+```bash
+python train_preprocessed.py \
+  --manifest data/preprocessed_v2/preprocessed_manifest.csv \
+  --target insulin \
+  --output-dir runs/insulin_preprocessed_v2 \
+  --model resnet18 \
+  --image-size 224 \
+  --roi-size 128 \
+  --epochs 25 \
+  --batch-size 32 \
+  --lr 0.0001 \
+  --weight-decay 0.0001 \
+  --num-workers 4
+```
+
+`train_preprocessed.py` forces NPZ-only loading through
+`PreprocessedSecretorDataset`; the original TIFF paths are retained only for
+reporting and are not read during training. Use a new preprocessing output
+directory whenever preprocessing parameters change, and never mix caches from
+different preprocessing versions in one experiment.
+
 ## GPU Setup
 
 This project uses GPU automatically when PyTorch can see CUDA:

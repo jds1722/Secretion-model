@@ -32,6 +32,7 @@ from tqdm import tqdm
 
 from src.dataset import INDEX_TO_LABEL, VALID_TARGETS, SecretorTiffDataset
 from src.model import MODEL_NAMES, create_binary_classifier, get_gradcam_layer
+from src.preprocessed_dataset import PreprocessedSecretorDataset
 
 
 class Tee:
@@ -52,6 +53,11 @@ class Tee:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
+    parser.add_argument(
+        "--preprocessed",
+        action="store_true",
+        help="Read cached NPZ tensors from preprocessed_path instead of source TIFFs.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument(
@@ -511,21 +517,24 @@ def main() -> None:
         if torch.cuda.is_available():
             print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-        train_ds = SecretorTiffDataset(
+        dataset_class = (
+            PreprocessedSecretorDataset if args.preprocessed else SecretorTiffDataset
+        )
+        train_ds = dataset_class(
             args.manifest,
             split="train",
             image_size=args.image_size,
             target=args.target,
             roi_size=args.roi_size,
         )
-        val_ds = SecretorTiffDataset(
+        val_ds = dataset_class(
             args.manifest,
             split="val",
             image_size=args.image_size,
             target=args.target,
             roi_size=args.roi_size,
         )
-        test_ds = SecretorTiffDataset(
+        test_ds = dataset_class(
             args.manifest,
             split="test",
             image_size=args.image_size,
@@ -575,7 +584,7 @@ def main() -> None:
                 )
             checkpoint = torch.load(resume_path, map_location=device)
             saved_args = checkpoint.get("args", {})
-            for name in ("target", "image_size", "roi_size", "model"):
+            for name in ("target", "image_size", "roi_size", "model", "preprocessed"):
                 saved_value = saved_args.get(
                     name, "resnet18" if name == "model" else None
                 )
