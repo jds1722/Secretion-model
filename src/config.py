@@ -6,8 +6,8 @@ class LayerConfig:
     bf: int = 0
     nucleus: int = 1
     autofluorescence: int = 2
-    bead_ins: int = 5
-    bead_gcg: int = 7
+    bead_ins: int = 7
+    bead_gcg: int = 5
 
 
 @dataclass(frozen=True)

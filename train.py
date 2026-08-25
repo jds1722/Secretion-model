@@ -11,6 +11,9 @@ import sys
 import time
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -142,6 +145,14 @@ def setup_logging(output_dir: Path, log_file: str | None) -> object:
     sys.stderr = Tee(sys.__stderr__, log_handle)
     print(f"Logging to {log_path}")
     return log_handle
+
+
+def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    """Publish dashboard state without exposing partially written JSON."""
+    payload = {**payload, "updated_at": dt.datetime.now().isoformat(timespec="seconds")}
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def evaluate(
@@ -505,6 +516,32 @@ def main() -> None:
     with os.fdopen(lock_fd, "w", encoding="utf-8") as lock_file:
         lock_file.write(f"pid={os.getpid()}\n")
     log_handle = setup_logging(output_dir, args.log_file)
+    progress_path = output_dir / "progress.json"
+    progress_state: dict[str, object] = {
+        "status": "initializing",
+        "pid": os.getpid(),
+        "target": args.target or "label",
+        "model": args.model,
+        "preprocessed": bool(args.preprocessed),
+        "epoch": 0,
+        "total_epochs": args.epochs,
+        "batch": 0,
+        "total_batches": 0,
+        "epoch_progress": 0.0,
+        "overall_progress": 0.0,
+        "elapsed_seconds": 0.0,
+        "eta_seconds": None,
+        "val_auroc": None,
+        "val_accuracy": None,
+        "best_validation_score": None,
+        "best_epoch": 0,
+    }
+
+    def publish_progress(**values: object) -> None:
+        progress_state.update(values)
+        write_json_atomic(progress_path, progress_state)
+
+    publish_progress()
 
     try:
         with open(output_dir / "run_config.json", "w", encoding="utf-8") as config_file:
@@ -516,6 +553,11 @@ def main() -> None:
         print(f"Device: {device}")
         if torch.cuda.is_available():
             print(f"GPU: {torch.cuda.get_device_name(0)}")
+        publish_progress(
+            status="loading_data",
+            device=str(device),
+            gpu=(torch.cuda.get_device_name(0) if torch.cuda.is_available() else None),
+        )
 
         dataset_class = (
             PreprocessedSecretorDataset if args.preprocessed else SecretorTiffDataset
@@ -544,6 +586,11 @@ def main() -> None:
         print(
             "Dataset sizes: "
             f"train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}"
+        )
+        publish_progress(
+            train_samples=len(train_ds),
+            validation_samples=len(val_ds),
+            test_samples=len(test_ds),
         )
 
         train_loader = DataLoader(
@@ -631,6 +678,7 @@ def main() -> None:
                 f"continuing at epoch {start_epoch}/{args.epochs}"
             )
         training_start = time.time()
+        publish_progress(status="running", started_at=dt.datetime.now().isoformat(timespec="seconds"))
 
         for epoch in range(start_epoch, args.epochs + 1):
             epoch_start = time.time()
@@ -653,6 +701,25 @@ def main() -> None:
                 running_loss += float(loss.item()) * x.size(0)
                 if batch_index % progress_interval == 0 or batch_index == total_batches:
                     batch_percent = 100.0 * batch_index / max(total_batches, 1)
+                    elapsed_seconds = time.time() - training_start
+                    completed_fraction = (
+                        (epoch - 1) + batch_index / max(total_batches, 1)
+                    ) / max(args.epochs, 1)
+                    eta_seconds = (
+                        elapsed_seconds * (1.0 - completed_fraction) / completed_fraction
+                        if completed_fraction > 0 else None
+                    )
+                    publish_progress(
+                        status="running",
+                        epoch=epoch,
+                        batch=batch_index,
+                        total_batches=total_batches,
+                        epoch_progress=batch_index / max(total_batches, 1),
+                        overall_progress=completed_fraction,
+                        elapsed_seconds=elapsed_seconds,
+                        eta_seconds=eta_seconds,
+                        running_train_loss=running_loss / max(batch_index * args.batch_size, 1),
+                    )
                     print(
                         f"Batch progress epoch {epoch}/{args.epochs}: "
                         f"{batch_index}/{total_batches} ({batch_percent:.1f}%)",
@@ -660,6 +727,7 @@ def main() -> None:
                     )
 
             train_loss = running_loss / len(train_ds)
+            publish_progress(status="validating", epoch=epoch, batch=total_batches)
             val_metrics = evaluate(model, val_loader, device, criterion)
             epoch_seconds = time.time() - epoch_start
             elapsed_seconds = time.time() - training_start
@@ -734,6 +802,23 @@ def main() -> None:
                         f"epochs without improvement > {args.early_stopping_min_delta:g}"
                     )
 
+            publish_progress(
+                status="running",
+                epoch=epoch,
+                batch=total_batches,
+                total_batches=total_batches,
+                epoch_progress=1.0,
+                overall_progress=epoch / max(args.epochs, 1),
+                elapsed_seconds=elapsed_seconds,
+                eta_seconds=eta_seconds,
+                train_loss=float(train_loss),
+                val_loss=float(val_metrics.get("loss", float("nan"))),
+                val_auroc=float(val_metrics.get("auroc", float("nan"))),
+                val_accuracy=float(val_metrics.get("accuracy", float("nan"))),
+                best_validation_score=float(best_auroc),
+                best_epoch=int(best_epoch),
+            )
+
             latest_checkpoint = {
                 "epoch": epoch,
                 "model_state": model.state_dict(),
@@ -779,6 +864,12 @@ def main() -> None:
         with open(output_dir / "training_summary.json", "w", encoding="utf-8") as f:
             json.dump(training_summary, f, indent=2)
 
+        publish_progress(
+            status="evaluating_test",
+            epoch=completed_epoch,
+            best_validation_score=float(best_auroc),
+            best_epoch=int(best_epoch),
+        )
         checkpoint = torch.load(output_dir / "best_model.pt", map_location=device)
         model.load_state_dict(checkpoint["model_state"])
         decision_threshold = float(checkpoint.get("decision_threshold", 0.5))
@@ -819,6 +910,26 @@ def main() -> None:
         print(f"decision_threshold {decision_threshold:.2f}")
         print(f"saved plots to {output_dir}")
         print(f"Finished at {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        publish_progress(
+            status="complete",
+            epoch=completed_epoch,
+            batch=0,
+            total_batches=0,
+            epoch_progress=1.0,
+            overall_progress=1.0,
+            eta_seconds=0.0,
+            best_validation_score=float(best_auroc),
+            best_epoch=int(best_epoch),
+            test_metrics=test_metrics,
+            finished_at=dt.datetime.now().isoformat(timespec="seconds"),
+        )
+    except BaseException as error:
+        publish_progress(
+            status="failed",
+            error=f"{type(error).__name__}: {error}",
+            failed_at=dt.datetime.now().isoformat(timespec="seconds"),
+        )
+        raise
     finally:
         sys.stdout = sys.__stdout__
         sys.stderr = sys.__stderr__

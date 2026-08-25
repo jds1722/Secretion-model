@@ -21,7 +21,7 @@ def make_bead_mask(
     layer_config: LayerConfig = LAYERS,
     preprocess_config: PreprocessConfig = PREPROCESS,
 ) -> np.ndarray:
-    """Detect INS/GCG bead regions from layers 5 and 7."""
+    """Detect INS/GCG bead regions from array-indexed layers 7 and 5."""
     ins = _safe_layer(stack, layer_config.bead_ins).astype(np.float32)
     gcg = _safe_layer(stack, layer_config.bead_gcg).astype(np.float32)
 

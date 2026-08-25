@@ -3,8 +3,8 @@ seed: 17
 layers:
   bf: 0
   nucleus: 1
-  bead_ins: 5
-  bead_gcg: 7
+  bead_ins: 7
+  bead_gcg: 5
   ignore: [2, 3, 4, 6]
 
 preprocess:

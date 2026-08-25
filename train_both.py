@@ -14,6 +14,11 @@ def parse_args() -> argparse.Namespace:
         description="Train independent insulin and glucagon models sequentially."
     )
     parser.add_argument("--manifest", required=True)
+    parser.add_argument(
+        "--preprocessed",
+        action="store_true",
+        help="Use NPZ tensors from preprocessed_path instead of source TIFFs.",
+    )
     parser.add_argument("--output-prefix", required=True)
     parser.add_argument("--epochs", type=int, required=True)
     parser.add_argument("--batch-size", type=int, required=True)
@@ -56,6 +61,8 @@ def main() -> None:
             "--early-stopping-patience", str(args.early_stopping_patience),
             "--early-stopping-min-delta", str(args.early_stopping_min_delta),
         ]
+        if args.preprocessed:
+            command.append("--preprocessed")
         if args.pretrained:
             command.append("--pretrained")
         result = subprocess.run(command, cwd=root, env=env, check=False)

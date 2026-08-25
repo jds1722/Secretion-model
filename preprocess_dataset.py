@@ -17,7 +17,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Preprocess TIFFs once into independent NPZ tensors."
     )
-    parser.add_argument("--manifest", required=True, help="Source TIFF manifest CSV")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--manifest", help="Source TIFF manifest CSV")
+    source.add_argument(
+        "--input-dir",
+        help="Folder to search recursively for .tif and .tiff files.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--out-manifest", default=None)
     parser.add_argument("--roi-size", type=int, default=128)
@@ -41,9 +46,19 @@ def cache_name(source: Path) -> str:
     return f"{source.stem}_{digest}.npz"
 
 
+def discover_tiffs(input_dir: Path) -> list[Path]:
+    """Return all TIFF files below a folder in deterministic path order."""
+    if not input_dir.is_dir():
+        raise ValueError(f"Input folder does not exist: {input_dir}")
+    return sorted(
+        path.resolve()
+        for path in input_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".tif", ".tiff"}
+    )
+
+
 def main() -> None:
     args = parse_args()
-    source_manifest = Path(args.manifest)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     out_manifest = (
@@ -51,7 +66,17 @@ def main() -> None:
         if args.out_manifest
         else output_dir / "preprocessed_manifest.csv"
     )
-    df = pd.read_csv(source_manifest)
+    if args.manifest:
+        source_manifest = Path(args.manifest)
+        df = pd.read_csv(source_manifest)
+    else:
+        paths = discover_tiffs(Path(args.input_dir))
+        if not paths:
+            raise ValueError(f"No TIFF files found under: {args.input_dir}")
+        df = pd.DataFrame({"path": [str(path) for path in paths]})
+        source_manifest = output_dir / "source_manifest.csv"
+        df.to_csv(source_manifest, index=False)
+        print(f"Found {len(df)} TIFF files; source manifest: {source_manifest}")
     if "path" not in df.columns:
         raise ValueError("Source manifest must contain a path column")
 

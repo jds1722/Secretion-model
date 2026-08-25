@@ -26,8 +26,8 @@ Autofluorescence and bead fluorescence channels are used only to find ignored
 regions in the model input:
 
 - Layer 2: bead/nanowell autofluorescence
-- Layer 5: INS capture beads
-- Layer 7: GCG capture beads
+- Layer 7: INS capture beads
+- Layer 5: GCG capture beads
 
 Layers 3, 4, and 6 are ignored.
 
@@ -135,6 +135,21 @@ model training never opens or reprocesses the source TIFF files.
 
 First create the usual source manifest, then preprocess it once:
 
+On Windows, launch the folder-browsing UI with:
+
+```bash
+python preprocess_ui.py
+```
+
+The UI can select either an input TIFF folder (searched recursively) or an
+existing source manifest CSV, plus the output folder. Folder mode writes the
+discovered file list to `source_manifest.csv` in the output directory. It also
+exposes the object-size and morphology settings and displays the preprocessing
+log. A representative
+multi-layer TIFF can also be selected to compare a raw BF/nucleus/bead
+composite with the final three-channel model input before processing the full
+dataset. The equivalent command-line workflow is:
+
 ```bash
 python preprocess_dataset.py \
   --manifest data/manifest.csv \
@@ -146,6 +161,14 @@ python preprocess_dataset.py \
   --nucleus-min-diameter 10 \
   --nucleus-max-diameter 100 \
   --cell-opening-px 4
+```
+
+To process every TIFF under a folder without preparing a manifest first:
+
+```bash
+python preprocess_dataset.py \
+  --input-dir data/raw_tiffs \
+  --output-dir data/preprocessed_v2
 ```
 
 This writes:
@@ -168,6 +191,40 @@ counts. Add `--fail-on-qc` to exclude samples without a valid nucleus from the
 trainable manifest while retaining every result in `preprocess_qc_all.csv`.
 
 Train only from those frozen tensors with the separate entry point:
+
+On Windows, the corresponding NPZ-only training UI can be opened with:
+
+```bash
+python train_preprocessed_ui.py
+```
+
+For a Streamlit dashboard with preprocessing progress, background NPZ training,
+cross-run model metrics/learning-curve comparison, Grad-CAM QC previews, and
+NPZ-only prediction, run:
+
+```bash
+streamlit run preprocessed_dashboard.py
+```
+
+Every dashboard path field supports direct typing plus a server-side drive,
+folder, and file browser. The Manifest Builder page combines completed
+`insulin|glucagon/high|low` preprocessing folders, assigns labels, groups
+augmented variants by their original source ID, and writes deterministic
+train/validation/test splits.
+
+The Training page uses target, schedule-mode, and model checkboxes. One click
+launches every selected target/model combination sequentially through
+`train_preprocessed_batch.py`, with either model-specific recommended schedules
+or one shared custom schedule.
+
+Training runs publish atomic `progress.json` files and multi-run queues publish
+`*_batch_progress.json`. The Streamlit Training page refreshes every three
+seconds to show queue position, current target/model, epoch and batch progress,
+validation AUROC, best score, ETA, device, job states, and a tail of `train.log`.
+
+The dashboard Prediction page calls `predict_preprocessed.py`; it reads cached
+NPZ tensors and refuses legacy checkpoints so prediction uses the same frozen
+preprocessing distribution as training.
 
 ```bash
 python train_preprocessed.py \
