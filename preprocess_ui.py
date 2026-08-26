@@ -292,7 +292,12 @@ class PreprocessApp(tk.Tk):
                 object_config=config,
                 roi_size=int(values["ROI size"]),
             )
-            after = np.moveaxis(np.clip(model_input, 0.0, 1.0), 0, -1)
+            # Three-color preview of the four model channels: BF, nucleus
+            # fluorescence, and the new nucleus-localized BF channel.
+            after = np.stack(
+                [model_input[0], model_input[1], model_input[3]], axis=-1
+            )
+            after = np.clip(after, 0.0, 1.0)
             self.messages.put(("preview_done", (raw, after, qc)))
         except Exception as error:
             self.messages.put(("preview_error", str(error)))

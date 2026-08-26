@@ -368,7 +368,7 @@ def build_model_input(
     preprocess_config: PreprocessConfig = PREPROCESS,
     roi_size: int | None = None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Return BF, nucleus, and nucleus-guided cell-mask model channels."""
+    """Return BF, nucleus, cell-mask, and fluorescence-localized nucleus-BF channels."""
     bead_mask = make_bead_mask(stack, layer_config, preprocess_config)
     autofluorescence_mask = make_autofluorescence_mask(
         stack,
@@ -457,6 +457,11 @@ def build_model_input(
         )
         cell_mask, _ = crop_square_roi(cell_mask, nucleus_center, effective_roi_size)
 
+    # Transfer the Layer-1 nucleus coordinates directly onto the cleaned Layer-0
+    # BF image.  This is sampled before whole-cell background attenuation so the
+    # fourth channel contains the actual normalized BF intensities at the nucleus.
+    nucleus_bf = np.where(primary_nucleus_mask, bf, 0.0).astype(np.float32)
+
     bf, soft_cell_mask = attenuate_cell_background(bf, cell_mask, preprocess_config)
     # Re-mask after normalization, cropping, and background attenuation so the
     # exact tensor seen by the model contains no bead-shaped BF structure.
@@ -466,7 +471,9 @@ def build_model_input(
         cell_mask,
         preprocess_config.artifact_mask_feather_px,
     )
-    model_input = np.stack([bf, nucleus, soft_cell_mask], axis=0).astype(np.float32)
+    model_input = np.stack(
+        [bf, nucleus, soft_cell_mask, nucleus_bf], axis=0
+    ).astype(np.float32)
     masks = {
         "bead": bead_mask,
         "autofluorescence": autofluorescence_mask,
@@ -476,6 +483,7 @@ def build_model_input(
         "primary_nucleus": primary_nucleus_mask,
         "cell": cell_mask,
         "soft_cell": soft_cell_mask,
+        "nucleus_bf": nucleus_bf,
         "nucleus_center": np.asarray(nucleus_center, dtype=np.float32),
         "roi_bounds": np.asarray(roi_bounds, dtype=np.int32),
         "effective_roi_size": np.asarray(effective_roi_size, dtype=np.int32),

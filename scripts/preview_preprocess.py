@@ -38,7 +38,7 @@ def main() -> None:
         autofluorescence_removal_mask = masks["autofluorescence_removal"]
         ignore_mask = masks["ignore"]
 
-        fig, axes = plt.subplots(1, 10, figsize=(25, 3))
+        fig, axes = plt.subplots(1, 11, figsize=(28, 3))
         axes[0].imshow(bf_raw, cmap="gray")
         axes[0].set_title("BF raw")
         axes[1].imshow(nucleus_raw, cmap="gray")
@@ -59,6 +59,8 @@ def main() -> None:
         axes[8].set_title("BF masked")
         axes[9].imshow(model_input[1], cmap="gray")
         axes[9].set_title("Nucleus masked")
+        axes[10].imshow(model_input[3], cmap="gray", vmin=0, vmax=1)
+        axes[10].set_title("Nucleus-localized BF")
 
         for ax in axes:
             ax.axis("off")
@@ -74,4 +76,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+from .config import MODEL_INPUT_CHANNELS
 from .dataset import LABEL_TO_INDEX, VALID_TARGETS
 
 
@@ -48,6 +49,12 @@ class PreprocessedSecretorDataset(Dataset):
         with np.load(cache_path, allow_pickle=False) as cached:
             image = np.asarray(cached["image"], dtype=np.float32)
             ignore = np.asarray(cached["ignore_mask"], dtype=np.float32)
+        if image.ndim != 3 or image.shape[0] != MODEL_INPUT_CHANNELS:
+            raise ValueError(
+                f"Cached tensor {cache_path} has shape {image.shape}; expected "
+                f"({MODEL_INPUT_CHANNELS}, H, W). Re-run preprocessing to create "
+                "the four-channel cache."
+            )
         x = F.interpolate(
             torch.from_numpy(image).unsqueeze(0),
             size=(self.image_size, self.image_size),

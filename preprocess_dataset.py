@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from src.config import MODEL_CHANNEL_NAMES, MODEL_INPUT_CHANNELS
 from src.preprocess_v2 import ObjectPreprocessConfig, build_model_input_v2
 from src.tiff_io import read_multilayer_tiff
 
@@ -57,6 +58,17 @@ def discover_tiffs(input_dir: Path) -> list[Path]:
     )
 
 
+def cache_has_current_channels(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with np.load(path, allow_pickle=False) as cached:
+            image = cached["image"]
+            return image.ndim == 3 and image.shape[0] == MODEL_INPUT_CHANNELS
+    except (OSError, ValueError, KeyError):
+        return False
+
+
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
@@ -93,7 +105,15 @@ def main() -> None:
     if object_config.nucleus_min_diameter > object_config.nucleus_max_diameter:
         raise ValueError("nucleus minimum diameter cannot exceed maximum diameter")
     (output_dir / "preprocess_run_config.json").write_text(
-        json.dumps(vars(args), indent=2), encoding="utf-8"
+        json.dumps(
+            {
+                **vars(args),
+                "input_channels": MODEL_INPUT_CHANNELS,
+                "channel_names": list(MODEL_CHANNEL_NAMES),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
     )
 
     output_rows = []
@@ -104,7 +124,7 @@ def main() -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         try:
             qc_path = destination.with_suffix(".qc.json")
-            if args.overwrite or not destination.exists() or not qc_path.exists():
+            if args.overwrite or not cache_has_current_channels(destination) or not qc_path.exists():
                 stack = read_multilayer_tiff(source)
                 image, masks, qc = build_model_input_v2(
                     stack, object_config=object_config, roi_size=args.roi_size

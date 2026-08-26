@@ -13,6 +13,7 @@ The model input is restricted to morphology-derived channels only:
 - Layer 0: brightfield (BF)
 - Layer 1: nuclear fluorescence
 - Channel 2: a nucleus-guided BF cell mask (derived, not a TIFF layer)
+- Channel 3: Layer-0 BF pixels at the primary-nucleus coordinates detected in Layer 1
 
 The nucleus channel identifies the primary nucleus. Its centroid seeds a BF
 watershed segmentation, so distant BF structures cannot become the target cell.
@@ -147,7 +148,7 @@ discovered file list to `source_manifest.csv` in the output directory. It also
 exposes the object-size and morphology settings and displays the preprocessing
 log. A representative
 multi-layer TIFF can also be selected to compare a raw BF/nucleus/bead
-composite with the final three-channel model input before processing the full
+composite with the final four-channel model input before processing the full
 dataset. The equivalent command-line workflow is:
 
 ```bash
@@ -298,4 +299,3 @@ preserving pixels with clear Layer 1 nucleus signal.
 
 If a bead overlaps the nucleus or covers a large part of the cell, exclude that
 image during manual curation or keep it in a separate QC folder.
-

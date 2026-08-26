@@ -38,3 +38,7 @@ class PreprocessConfig:
 LAYERS = LayerConfig()
 PREPROCESS = PreprocessConfig()
 
+# Model channels are ordered and versioned here so TIFF, cached-NPZ, training,
+# and prediction paths cannot silently disagree about the input tensor.
+MODEL_CHANNEL_NAMES = ("bf", "nucleus", "soft_cell_mask", "nucleus_bf")
+MODEL_INPUT_CHANNELS = len(MODEL_CHANNEL_NAMES)

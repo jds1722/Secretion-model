@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+from .config import MODEL_INPUT_CHANNELS
 from .preprocess import build_model_input
 from .tiff_io import read_multilayer_tiff
 
@@ -61,6 +62,11 @@ class SecretorTiffDataset(Dataset):
         path = Path(row["path"])
         stack = read_multilayer_tiff(path)
         image, masks = build_model_input(stack, roi_size=self.roi_size)
+        if image.ndim != 3 or image.shape[0] != MODEL_INPUT_CHANNELS:
+            raise ValueError(
+                f"Expected {MODEL_INPUT_CHANNELS} model channels, got shape "
+                f"{image.shape} for {path}"
+            )
 
         x = torch.from_numpy(image)
         x = F.interpolate(
@@ -90,4 +96,3 @@ class SecretorTiffDataset(Dataset):
             "path": str(path),
             "ignore_mask": ignore_mask.bool(),
         }
-

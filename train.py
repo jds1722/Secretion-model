@@ -33,6 +33,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from src.config import MODEL_CHANNEL_NAMES, MODEL_INPUT_CHANNELS
 from src.dataset import INDEX_TO_LABEL, VALID_TARGETS, SecretorTiffDataset
 from src.model import MODEL_NAMES, create_binary_classifier, get_gradcam_layer
 from src.preprocessed_dataset import PreprocessedSecretorDataset
@@ -453,23 +454,26 @@ def save_preprocess_attention_examples(
         bf = image_np[0]
         nucleus = image_np[1]
         cell_mask = image_np[2]
+        nucleus_bf = image_np[3]
         ignore_mask = item["ignore_mask"].detach().cpu().numpy()
         overlay_base = np.clip((bf + nucleus) / 2.0, 0.0, 1.0)
 
-        fig, axes = plt.subplots(1, 6, figsize=(18, 3))
+        fig, axes = plt.subplots(1, 7, figsize=(21, 3))
         axes[0].imshow(bf, cmap="gray", vmin=0, vmax=1)
         axes[0].set_title("BF preprocessed")
         axes[1].imshow(nucleus, cmap="gray", vmin=0, vmax=1)
         axes[1].set_title("Nucleus preprocessed")
         axes[2].imshow(cell_mask, cmap="viridis", vmin=0, vmax=1)
         axes[2].set_title("Nucleus-guided cell mask")
-        axes[3].imshow(ignore_mask, cmap="magma")
-        axes[3].set_title("Ignore mask")
-        axes[4].imshow(heatmap, cmap="inferno", vmin=0, vmax=1)
-        axes[4].set_title("Model focus (Grad-CAM)")
-        axes[5].imshow(overlay_base, cmap="gray", vmin=0, vmax=1)
-        axes[5].imshow(heatmap, cmap="inferno", alpha=0.45, vmin=0, vmax=1)
-        axes[5].set_title("Overlay")
+        axes[3].imshow(nucleus_bf, cmap="gray", vmin=0, vmax=1)
+        axes[3].set_title("Nucleus-localized BF")
+        axes[4].imshow(ignore_mask, cmap="magma")
+        axes[4].set_title("Ignore mask")
+        axes[5].imshow(heatmap, cmap="inferno", vmin=0, vmax=1)
+        axes[5].set_title("Model focus (Grad-CAM)")
+        axes[6].imshow(overlay_base, cmap="gray", vmin=0, vmax=1)
+        axes[6].imshow(heatmap, cmap="inferno", alpha=0.45, vmin=0, vmax=1)
+        axes[6].set_title("Overlay")
 
         for ax in axes:
             ax.axis("off")
@@ -503,6 +507,11 @@ def save_preprocess_attention_examples(
 
 def main() -> None:
     args = parse_args()
+    training_args = {
+        **vars(args),
+        "input_channels": MODEL_INPUT_CHANNELS,
+        "channel_names": list(MODEL_CHANNEL_NAMES),
+    }
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_path = output_dir / "training.lock"
@@ -545,7 +554,7 @@ def main() -> None:
 
     try:
         with open(output_dir / "run_config.json", "w", encoding="utf-8") as config_file:
-            json.dump(vars(args), config_file, indent=2)
+            json.dump(training_args, config_file, indent=2)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Started at {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Target: {args.target or 'label'}")
@@ -604,7 +613,7 @@ def main() -> None:
         test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
 
         model = create_binary_classifier(
-            args.model, in_channels=3, pretrained=args.pretrained
+            args.model, in_channels=MODEL_INPUT_CHANNELS, pretrained=args.pretrained
         ).to(device)
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -631,6 +640,13 @@ def main() -> None:
                 )
             checkpoint = torch.load(resume_path, map_location=device)
             saved_args = checkpoint.get("args", {})
+            saved_input_channels = int(saved_args.get("input_channels", 3))
+            if saved_input_channels != MODEL_INPUT_CHANNELS:
+                raise ValueError(
+                    "Cannot resume a checkpoint with a different model input: "
+                    f"checkpoint={saved_input_channels} channels, "
+                    f"current={MODEL_INPUT_CHANNELS} channels. Start a new run."
+                )
             for name in ("target", "image_size", "roi_size", "model", "preprocessed"):
                 saved_value = saved_args.get(
                     name, "resnet18" if name == "model" else None
@@ -776,7 +792,7 @@ def main() -> None:
                 torch.save(
                     {
                         "model_state": model.state_dict(),
-                        "args": vars(args),
+                        "args": training_args,
                         "target": args.target,
                         "val_metrics": val_metrics,
                         "decision_threshold": decision_threshold,
@@ -827,7 +843,7 @@ def main() -> None:
                 "best_epoch": best_epoch,
                 "epochs_without_improvement": epochs_without_improvement,
                 "history": history,
-                "args": vars(args),
+                "args": training_args,
             }
             temporary_checkpoint_path = output_dir / "latest_checkpoint.pt.tmp"
             torch.save(latest_checkpoint, temporary_checkpoint_path)
@@ -852,6 +868,8 @@ def main() -> None:
         training_summary = {
             "model": args.model,
             "target": args.target,
+            "input_channels": MODEL_INPUT_CHANNELS,
+            "channel_names": list(MODEL_CHANNEL_NAMES),
             "configured_max_epochs": args.epochs,
             "completed_epoch": completed_epoch,
             "best_epoch": best_epoch,

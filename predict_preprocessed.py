@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from src.dataset import INDEX_TO_LABEL
-from src.model import create_binary_classifier
+from src.model import create_binary_classifier, get_input_channels
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,8 +47,14 @@ def load_model(
             f"Checkpoint was not trained in preprocessed mode: {checkpoint_path}"
         )
     model_name = saved_args.get("model", "resnet18")
+    state = checkpoint["model_state"]
+    input_weight_keys = ("conv1.weight", "features.0.0.weight")
+    input_channels = next(
+        (int(state[key].shape[1]) for key in input_weight_keys if key in state),
+        int(saved_args.get("input_channels", 3)),
+    )
     model = create_binary_classifier(
-        model_name, in_channels=3, pretrained=False
+        model_name, in_channels=input_channels, pretrained=False
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
@@ -107,6 +113,12 @@ def main() -> None:
             if input_target and target and input_target != target:
                 continue
             image_size = args.image_size or saved_image_size
+            expected_channels = get_input_channels(model)
+            if image.ndim != 3 or image.shape[0] != expected_channels:
+                raise ValueError(
+                    f"Tensor/checkpoint channel mismatch for {cache_path}: tensor "
+                    f"shape={image.shape}, checkpoint expects {expected_channels} channels."
+                )
             x = F.interpolate(
                 torch.from_numpy(image).unsqueeze(0),
                 size=(image_size, image_size),

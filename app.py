@@ -187,7 +187,7 @@ def roi_preview(folder: Path, key: str) -> int:
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
 
-    fig, axes = plt.subplots(1, 4, figsize=(15, 4))
+    fig, axes = plt.subplots(1, 5, figsize=(18, 4))
     axes[0].imshow(robust_normalize(stack[0]), cmap="gray")
     axes[0].add_patch(
         Rectangle(
@@ -204,6 +204,8 @@ def roi_preview(folder: Path, key: str) -> int:
     axes[2].set_title("Model BF input")
     axes[3].imshow(model_input[2], cmap="viridis", vmin=0, vmax=1)
     axes[3].set_title("Nucleus-guided cell mask")
+    axes[4].imshow(model_input[3], cmap="gray", vmin=0, vmax=1)
+    axes[4].set_title("Nucleus-localized BF")
     for axis in axes:
         axis.axis("off")
     fig.tight_layout()

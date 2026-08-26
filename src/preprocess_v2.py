@@ -267,11 +267,16 @@ def build_model_input_v2(
     ) = cropped
     raw_bf_roi, _ = crop_square_roi(raw_bf, center, effective_roi)
 
+    # Apply the nucleus detected in Layer 1 to the same coordinates in Layer 0.
+    nucleus_bf = np.where(primary_nucleus, bf, 0.0).astype(np.float32)
+
     bf, soft_cell = attenuate_cell_background(bf, cell_mask, preprocess_config)
     bf = mask_beads_in_model_channel(
         bf, bead_mask, cell_mask, preprocess_config.artifact_mask_feather_px
     )
-    model_input = np.stack([bf, nucleus, soft_cell], axis=0).astype(np.float32)
+    model_input = np.stack(
+        [bf, nucleus, soft_cell, nucleus_bf], axis=0
+    ).astype(np.float32)
     qc: dict[str, object] = {
         **bead_counts,
         **nucleus_qc,
@@ -289,6 +294,7 @@ def build_model_input_v2(
         "primary_nucleus": primary_nucleus,
         "cell": cell_mask,
         "soft_cell": soft_cell,
+        "nucleus_bf": nucleus_bf,
         "roi_bounds": np.asarray(roi_bounds, dtype=np.int32),
     }
     return model_input, masks, qc
