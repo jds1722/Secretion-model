@@ -32,11 +32,12 @@ from sklearn.metrics import (
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
 from src.config import MODEL_CHANNEL_NAMES, MODEL_INPUT_CHANNELS
 from src.dataset import INDEX_TO_LABEL, VALID_TARGETS, SecretorTiffDataset
 from src.model import MODEL_NAMES, create_binary_classifier, get_gradcam_layer
 from src.preprocessed_dataset import PreprocessedSecretorDataset
+from src.resilient_io import replace_file, temporary_path, write_json_atomic
+from src.training_manifest import is_original_variant, source_id
 
 
 class Tee:
@@ -148,12 +149,17 @@ def setup_logging(output_dir: Path, log_file: str | None) -> object:
     return log_handle
 
 
-def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
-    """Publish dashboard state without exposing partially written JSON."""
-    payload = {**payload, "updated_at": dt.datetime.now().isoformat(timespec="seconds")}
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+def save_checkpoint_atomic(payload: dict[str, object], path: Path) -> None:
+    """Save a checkpoint without exposing a partial file to other processes."""
+    temporary = temporary_path(path)
+    try:
+        torch.save(payload, temporary)
+        replace_file(temporary, path, attempts=20)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def evaluate(
@@ -421,9 +427,72 @@ def compute_gradcam(
     return cam_np
 
 
+def gradcam_preview_indices(
+    dataset: SecretorTiffDataset | PreprocessedSecretorDataset,
+    max_images: int,
+) -> list[int]:
+    """Select one original image per source, balanced across available labels."""
+    if max_images <= 0 or len(dataset) == 0:
+        return []
+    dataframe = getattr(dataset, "df", None)
+    if not isinstance(dataframe, pd.DataFrame) or "path" not in dataframe.columns:
+        return list(range(min(max_images, len(dataset))))
+
+    candidates = dataframe.copy()
+    candidates["_dataset_index"] = np.arange(len(candidates), dtype=int)
+    candidates = candidates[
+        candidates["path"].astype(str).map(is_original_variant)
+    ].copy()
+    if candidates.empty:
+        return []
+
+    if "source_id" in candidates.columns:
+        source_groups = candidates["source_id"].fillna("").astype(str)
+        missing_group = source_groups.str.strip() == ""
+        source_groups.loc[missing_group] = candidates.loc[
+            missing_group, "path"
+        ].astype(str).map(source_id)
+    else:
+        source_groups = candidates["path"].astype(str).map(source_id)
+    candidates["_source_group"] = source_groups
+
+    group_columns = ["_source_group"]
+    if "hormone" in candidates.columns:
+        group_columns.insert(0, "hormone")
+    label_column = None
+    target = getattr(dataset, "target", None)
+    if target and f"{target}_label" in candidates.columns:
+        label_column = f"{target}_label"
+    elif "label" in candidates.columns:
+        label_column = "label"
+    if label_column:
+        group_columns.insert(0, label_column)
+
+    originals = candidates.drop_duplicates(group_columns, keep="first")
+    if not label_column:
+        return originals["_dataset_index"].astype(int).head(max_images).tolist()
+
+    label_order = list(
+        dict.fromkeys(originals[label_column].astype(str).str.lower())
+    )
+    queues = {
+        label: originals.loc[
+            originals[label_column].astype(str).str.lower() == label,
+            "_dataset_index",
+        ].astype(int).tolist()
+        for label in label_order
+    }
+    selected: list[int] = []
+    while len(selected) < max_images and any(queues.values()):
+        for label in label_order:
+            if queues[label] and len(selected) < max_images:
+                selected.append(queues[label].pop(0))
+    return selected
+
+
 def save_preprocess_attention_examples(
     model: nn.Module,
-    dataset: SecretorTiffDataset,
+    dataset: SecretorTiffDataset | PreprocessedSecretorDataset,
     device: torch.device,
     output_dir: Path,
     max_images: int,
@@ -437,9 +506,22 @@ def save_preprocess_attention_examples(
     rows = []
     target_layer = get_gradcam_layer(model)
     model.eval()
+    preview_indices = gradcam_preview_indices(dataset, max_images)
+    if not preview_indices:
+        print(
+            "WARNING: no original, non-augmented images were available for "
+            "Grad-CAM previews.",
+            flush=True,
+        )
+        return
+    print(
+        f"Grad-CAM previews: selected {len(preview_indices)} unique original "
+        f"images from {len(dataset)} test rows.",
+        flush=True,
+    )
 
-    for index in range(min(max_images, len(dataset))):
-        item = dataset[index]
+    for preview_number, dataset_index in enumerate(preview_indices):
+        item = dataset[dataset_index]
         x = item["image"].unsqueeze(0).to(device)
         label_idx = int(item["label"].item())
         path = Path(str(item["path"]))
@@ -487,13 +569,16 @@ def save_preprocess_attention_examples(
         )
         fig.tight_layout()
 
-        out_path = examples_dir / f"{index:03d}_{path.stem}_attention.png"
+        out_path = examples_dir / f"{preview_number:03d}_{path.stem}_attention.png"
         fig.savefig(out_path, dpi=180)
         plt.close(fig)
 
         rows.append(
             {
                 "path": str(path),
+                "source_id": source_id(str(path)),
+                "dataset_index": dataset_index,
+                "augmentation": "original",
                 "example_image": str(out_path),
                 "label": label_name,
                 "predicted_label": pred_name,
@@ -546,9 +631,23 @@ def main() -> None:
         "best_epoch": 0,
     }
 
+    progress_write_failures = 0
+
     def publish_progress(**values: object) -> None:
+        nonlocal progress_write_failures
         progress_state.update(values)
-        write_json_atomic(progress_path, progress_state)
+        try:
+            write_json_atomic(progress_path, progress_state, attempts=12)
+        except OSError as error:
+            progress_write_failures += 1
+            progress_state["progress_write_failures"] = progress_write_failures
+            progress_state["last_progress_write_error"] = str(error)
+            if progress_write_failures == 1 or progress_write_failures % 10 == 0:
+                print(
+                    "WARNING: progress.json is temporarily locked; training will "
+                    f"continue and the dashboard update will retry: {error}",
+                    flush=True,
+                )
 
     publish_progress()
 
@@ -789,7 +888,7 @@ def main() -> None:
                     val_probs,
                     decision_threshold,
                 )
-                torch.save(
+                save_checkpoint_atomic(
                     {
                         "model_state": model.state_dict(),
                         "args": training_args,
@@ -845,9 +944,7 @@ def main() -> None:
                 "history": history,
                 "args": training_args,
             }
-            temporary_checkpoint_path = output_dir / "latest_checkpoint.pt.tmp"
-            torch.save(latest_checkpoint, temporary_checkpoint_path)
-            os.replace(temporary_checkpoint_path, latest_checkpoint_path)
+            save_checkpoint_atomic(latest_checkpoint, latest_checkpoint_path)
             with open(output_dir / "history.json", "w", encoding="utf-8") as f:
                 json.dump(history, f, indent=2)
             pd.DataFrame(history).to_csv(output_dir / "history.csv", index=False)

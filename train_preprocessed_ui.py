@@ -11,6 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 import pandas as pd
 
 from src.model import MODEL_NAMES
+from src.training_manifest import DEFAULT_TRAINING_MANIFEST_NAME
 
 
 class PreprocessedTrainingApp(tk.Tk):
@@ -26,7 +27,12 @@ class PreprocessedTrainingApp(tk.Tk):
         self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
 
-        self.manifest = tk.StringVar()
+        default_manifest = (
+            self.project_dir / "data" / "tensors_0825" / DEFAULT_TRAINING_MANIFEST_NAME
+        )
+        self.manifest = tk.StringVar(
+            value=str(default_manifest) if default_manifest.is_file() else ""
+        )
         self.output_dir = tk.StringVar()
         self.target = tk.StringVar(value="auto")
         self.model = tk.StringVar(value="resnet18")
@@ -40,9 +46,11 @@ class PreprocessedTrainingApp(tk.Tk):
         self.preview_images = tk.StringVar(value="0")
         self.pretrained = tk.BooleanVar(value=False)
         self.resume = tk.BooleanVar(value=False)
-        self.manifest_summary = tk.StringVar(value="Select preprocessed_manifest.csv")
+        self.manifest_summary = tk.StringVar(value="Select a balanced-test training manifest")
 
         self._build_ui()
+        if self.manifest.get():
+            self.after(0, self._refresh_manifest_summary)
         self.after(100, self._drain_messages)
 
     def _build_ui(self) -> None:
@@ -130,8 +138,11 @@ class PreprocessedTrainingApp(tk.Tk):
         self.manifest.set(path)
         if not self.output_dir.get():
             self.output_dir.set(str(Path(path).parent / "training_run"))
+        self._refresh_manifest_summary()
+
+    def _refresh_manifest_summary(self) -> None:
         try:
-            df = pd.read_csv(path)
+            df = pd.read_csv(self.manifest.get())
             required = {"preprocessed_path", "label"}
             missing = sorted(required - set(df.columns))
             if missing:

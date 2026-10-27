@@ -25,12 +25,10 @@ class ObjectPreprocessConfig:
     bead_min_diameter: float = 5.0
     bead_max_diameter: float = 20.0
     bead_min_peak_distance: int = 7
-    bead_smoothing_sigma: float = 1.35
     bead_dilation_px: int = 2
     nucleus_min_diameter: float = 10.0
     nucleus_max_diameter: float = 100.0
     nucleus_min_peak_distance: int = 7
-    nucleus_smoothing_sigma: float = 1.35
     discard_border_nuclei: bool = True
     cell_opening_px: int = 4
 
@@ -66,8 +64,12 @@ def identify_round_objects(
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Threshold, declump, and size-filter fluorescence objects."""
     normalized = robust_normalize(image)
-    smoothed = filters.gaussian(normalized, sigma=smoothing_sigma, preserve_range=True)
-    binary = smoothed > _threshold(smoothed, threshold_method)
+    detection_image = (
+        filters.gaussian(normalized, sigma=smoothing_sigma, preserve_range=True)
+        if smoothing_sigma > 0
+        else normalized
+    )
+    binary = detection_image > _threshold(detection_image, threshold_method)
     min_area = max(4, int(np.pi * (min_diameter / 2) ** 2 / 3))
     binary = morphology.remove_small_objects(binary, max_size=max(0, min_area - 1))
     binary = ndi.binary_fill_holes(binary)
@@ -120,7 +122,7 @@ def make_object_bead_mask(
             threshold_method=method,
             min_diameter=object_config.bead_min_diameter,
             max_diameter=object_config.bead_max_diameter,
-            smoothing_sigma=object_config.bead_smoothing_sigma,
+            smoothing_sigma=0.0,
             min_peak_distance=object_config.bead_min_peak_distance,
             # Border beads remain artifacts and must still be hidden from the CNN.
             discard_border=False,
@@ -143,7 +145,7 @@ def find_primary_nucleus_v2(
         threshold_method="otsu",
         min_diameter=object_config.nucleus_min_diameter,
         max_diameter=object_config.nucleus_max_diameter,
-        smoothing_sigma=object_config.nucleus_smoothing_sigma,
+        smoothing_sigma=0.0,
         min_peak_distance=object_config.nucleus_min_peak_distance,
         discard_border=object_config.discard_border_nuclei,
     )
@@ -212,11 +214,11 @@ def build_model_input_v2(
     raw_bf = _safe_layer(stack, layer_config.bf)
     bf = fill_masked_regions(
         raw_bf, bead_mask, preprocess_config.fill_mode,
-        preprocess_config.artifact_mask_feather_px,
+        0.0,
     )
     nucleus = fill_masked_regions(
         _safe_layer(stack, layer_config.nucleus), bead_mask,
-        preprocess_config.fill_mode, preprocess_config.artifact_mask_feather_px,
+        preprocess_config.fill_mode, 0.0,
     )
     bf = robust_normalize(bf, preprocess_config.lower_percentile, preprocess_config.upper_percentile)
     nucleus = robust_normalize(
@@ -224,11 +226,11 @@ def build_model_input_v2(
     )
     bf = fill_masked_regions(
         bf, autofluorescence_removal, preprocess_config.fill_mode,
-        preprocess_config.artifact_mask_feather_px,
+        0.0,
     )
     nucleus = fill_masked_regions(
         nucleus, autofluorescence_removal, preprocess_config.fill_mode,
-        preprocess_config.artifact_mask_feather_px,
+        0.0,
     )
 
     center, primary_nucleus, nucleus_qc = find_primary_nucleus_v2(
@@ -244,6 +246,9 @@ def build_model_input_v2(
             )
             if opened.any():
                 cell_mask = ndi.binary_fill_holes(opened | primary_nucleus)
+        # Keep autofluorescence artifacts excluded even when the cell watershed
+        # falls back to a nucleus-centered circular mask or restores the nucleus.
+        cell_mask &= ~autofluorescence_removal
     else:
         cell_mask = np.zeros(bf.shape, bool)
 

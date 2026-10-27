@@ -22,7 +22,6 @@ class PreprocessConfig:
     nucleus_preserve_signal_percentile: float = 99.5
     nucleus_preserve_threshold_fraction: float = 0.35
     bead_dilation_px: int = 3
-    autofluorescence_dilation_px: int = 2
     nucleus_preserve_dilation_px: int = 1
     fill_mode: str = "median"
     roi_size: int | None = None

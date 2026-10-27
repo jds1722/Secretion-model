@@ -57,9 +57,6 @@ def make_autofluorescence_mask(
     mask = autofluorescence > threshold
 
     mask = morphology.remove_small_objects(mask, min_size=4)
-    if preprocess_config.autofluorescence_dilation_px > 0:
-        footprint = morphology.disk(preprocess_config.autofluorescence_dilation_px)
-        mask = morphology.binary_dilation(mask, footprint)
     return mask.astype(bool)
 
 

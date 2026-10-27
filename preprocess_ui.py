@@ -56,8 +56,16 @@ class PreprocessApp(tk.Tk):
         outer.rowconfigure(12, weight=1)
 
         ttk.Label(outer, text="Independent TIFF Pre-processing", font=("Segoe UI", 16, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 14)
+            row=0, column=0, sticky="w", pady=(0, 14)
         )
+        ttk.Label(
+            outer,
+            text=(
+                "Each run is launched as an independent background job. You may close "
+                "this window and launch other folders concurrently."
+            ),
+            foreground="#3a5f8a",
+        ).grid(row=0, column=1, columnspan=2, sticky="e", pady=(0, 14))
 
         self._path_row(outer, 1, "Input TIFF folder", self.input_dir, self._choose_input)
         self._path_row(outer, 2, "Or source manifest CSV", self.manifest, self._choose_manifest)
@@ -88,8 +96,11 @@ class PreprocessApp(tk.Tk):
 
         buttons = ttk.Frame(outer)
         buttons.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 8))
-        self.run_button = ttk.Button(buttons, text="Run pre-processing", command=self._start)
+        self.run_button = ttk.Button(buttons, text="Launch background job", command=self._start)
         self.run_button.pack(side="left")
+        ttk.Button(buttons, text="Open progress terminal", command=self._open_monitor).pack(
+            side="left", padx=(8, 0)
+        )
         ttk.Button(buttons, text="Open output folder", command=self._open_output).pack(side="left", padx=8)
         self.progress = ttk.Progressbar(buttons, mode="indeterminate")
         self.progress.pack(side="right", fill="x", expand=True, padx=(20, 0))
@@ -111,7 +122,7 @@ class PreprocessApp(tk.Tk):
         self.preview_status = ttk.Label(outer, text="")
         self.preview_status.grid(row=10, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
-        ttk.Label(outer, text="Run log").grid(row=11, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        ttk.Label(outer, text="Launcher log").grid(row=11, column=0, columnspan=3, sticky="w", pady=(8, 4))
         log_frame = ttk.Frame(outer)
         log_frame.grid(row=12, column=0, columnspan=3, sticky="nsew")
         log_frame.rowconfigure(0, weight=1)
@@ -203,8 +214,13 @@ class PreprocessApp(tk.Tk):
 
         self._numeric_values()
 
+        python_executable = Path(sys.executable)
+        if python_executable.name.lower() == "pythonw.exe":
+            console_python = python_executable.with_name("python.exe")
+            if console_python.is_file():
+                python_executable = console_python
         command = [
-            sys.executable,
+            str(python_executable),
             "-u",
             str(self.project_dir / "preprocess_dataset.py"),
             *source_args,
@@ -221,6 +237,7 @@ class PreprocessApp(tk.Tk):
             command.append("--overwrite")
         if self.fail_on_qc.get():
             command.append("--fail-on-qc")
+        command.append("--background")
         return command
 
     def _start_preview(self) -> None:
@@ -270,7 +287,7 @@ class PreprocessApp(tk.Tk):
                 threshold_method="otsu",
                 min_diameter=config.bead_min_diameter,
                 max_diameter=config.bead_max_diameter,
-                smoothing_sigma=config.bead_smoothing_sigma,
+                smoothing_sigma=0.0,
                 min_peak_distance=config.bead_min_peak_distance,
                 discard_border=False,
             )
@@ -279,7 +296,7 @@ class PreprocessApp(tk.Tk):
                 threshold_method="li",
                 min_diameter=config.bead_min_diameter,
                 max_diameter=config.bead_max_diameter,
-                smoothing_sigma=config.bead_smoothing_sigma,
+                smoothing_sigma=0.0,
                 min_peak_distance=config.bead_min_peak_distance,
                 discard_border=False,
             )
@@ -310,7 +327,7 @@ class PreprocessApp(tk.Tk):
         except ValueError as error:
             messagebox.showerror("Invalid settings", str(error), parent=self)
             return
-        self._append_log("Starting pre-processing...\n")
+        self._append_log("Launching independent background preprocessing job...\n")
         self.run_button.configure(state="disabled")
         self.progress.start(12)
         self.worker = threading.Thread(target=self._run_process, args=(command,), daemon=True)
@@ -318,19 +335,16 @@ class PreprocessApp(tk.Tk):
 
     def _run_process(self, command: list[str]) -> None:
         try:
-            process = subprocess.Popen(
+            result = subprocess.run(
                 command,
                 cwd=self.project_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
             )
-            assert process.stdout is not None
-            for line in process.stdout:
-                self.messages.put(("log", line))
-            self.messages.put(("done", process.wait()))
+            output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+            self.messages.put(("launch_done", (result.returncode, output)))
         except Exception as error:
             self.messages.put(("error", str(error)))
 
@@ -340,10 +354,11 @@ class PreprocessApp(tk.Tk):
                 kind, payload = self.messages.get_nowait()
                 if kind == "log":
                     self._append_log(str(payload))
-                elif kind == "done":
-                    self._finish(int(payload))
+                elif kind == "launch_done":
+                    return_code, output = payload
+                    self._finish_launch(int(return_code), str(output))
                 elif kind == "error":
-                    self._finish(-1, str(payload))
+                    self._finish_launch(-1, str(payload))
                 elif kind == "preview_done":
                     raw, after, qc = payload
                     self._show_previews(raw, after, qc)
@@ -373,16 +388,28 @@ class PreprocessApp(tk.Tk):
             )
         )
 
-    def _finish(self, return_code: int, error: str | None = None) -> None:
+    def _finish_launch(self, return_code: int, output: str = "") -> None:
         self.progress.stop()
         self.run_button.configure(state="normal")
+        if output:
+            self._append_log(output + "\n")
         if return_code == 0:
-            self._append_log("\nPre-processing completed successfully.\n")
-            messagebox.showinfo("Complete", "Pre-processing completed successfully.", parent=self)
+            self._append_log(
+                "Background job launched. It will continue after this UI closes.\n"
+            )
+            messagebox.showinfo(
+                "Background job launched",
+                (
+                    "Pre-processing is running independently. You can select another "
+                    "input/output folder and launch another job. Use Open progress "
+                    "terminal to monitor this output folder."
+                ),
+                parent=self,
+            )
         else:
-            detail = error or f"Process exited with code {return_code}. Check the run log."
-            self._append_log(f"\nERROR: {detail}\n")
-            messagebox.showerror("Pre-processing failed", detail, parent=self)
+            detail = output or f"Launcher exited with code {return_code}."
+            self._append_log(f"ERROR: {detail}\n")
+            messagebox.showerror("Launch failed", detail, parent=self)
 
     def _append_log(self, text: str) -> None:
         self.log.configure(state="normal")
@@ -396,6 +423,41 @@ class PreprocessApp(tk.Tk):
             messagebox.showerror("Output folder", "Select an existing output folder first.", parent=self)
             return
         subprocess.Popen(["explorer", str(path.resolve())])
+
+    def _open_monitor(self) -> None:
+        path = Path(self.output_dir.get().strip())
+        if not path.is_dir():
+            messagebox.showerror(
+                "Progress monitor",
+                "Select an existing preprocessing output folder first.",
+                parent=self,
+            )
+            return
+        monitor_python = Path(sys.executable)
+        if monitor_python.name.lower() == "pythonw.exe":
+            console_python = monitor_python.with_name("python.exe")
+            if console_python.is_file():
+                monitor_python = console_python
+        command = [
+            str(monitor_python),
+            "-u",
+            str(self.project_dir / "monitor_preprocessing.py"),
+            "--output-dir",
+            str(path.resolve()),
+            "--watch",
+            "--pause-on-exit",
+        ]
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(
+                    command,
+                    cwd=self.project_dir,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
+            else:
+                subprocess.Popen(command, cwd=self.project_dir, start_new_session=True)
+        except OSError as error:
+            messagebox.showerror("Progress monitor", str(error), parent=self)
 
 
 if __name__ == "__main__":

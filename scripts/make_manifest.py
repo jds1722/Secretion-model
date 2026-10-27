@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import re
+import sys
 from pathlib import Path
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-
-AUGMENTATION_SUFFIX_RE = re.compile(r"_(?:orig|rot90|rot180|rot270)(?:_flip_lr)?$")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.training_manifest import assign_manifest_splits, source_id
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,11 +30,6 @@ def parse_args() -> argparse.Namespace:
 
 def find_tiffs(folder: Path) -> list[Path]:
     return sorted(list(folder.glob("*.tif")) + list(folder.glob("*.tiff")))
-
-
-def source_id(path: Path) -> str:
-    """Return the original image id before augmentation suffixes."""
-    return AUGMENTATION_SUFFIX_RE.sub("", path.stem)
 
 
 def collect_rows(data_root: Path) -> list[dict[str, str]]:
@@ -73,6 +68,11 @@ def assign_splits(
     test_fraction: float,
     seed: int,
 ) -> pd.DataFrame:
+    if test_fraction > 0:
+        has_hormone = "hormone" in df.columns
+        prepared = df if has_hormone else df.assign(hormone="all")
+        result = assign_manifest_splits(prepared, val_fraction, test_fraction, seed)
+        return result if has_hormone else result.drop(columns="hormone")
     groups = df[["label", "source_id"]].drop_duplicates().reset_index(drop=True)
     groups = groups.assign(split="train")
 
@@ -148,4 +148,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

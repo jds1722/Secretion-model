@@ -60,8 +60,12 @@ python scripts/make_manifest.py \
 ```
 
 The manifest split is made by original image group, not by individual augmented
-files. Augmented variants such as `_orig`, `_rot90`, `_rot180`, `_rot270`, and
-`_flip_lr` stay in the same split so validation does not reuse training images.
+files. Augmented variants such as `_orig`, `_rot90`, `_rot180`, `_rot270`,
+`_flip_lr`, and `_shift_up_5px` / `_shift_down_5px` / `_shift_left_5px` /
+`_shift_right_5px` share one source ID and split, including combined suffixes.
+Shift suffixes accept any nonnegative integer pixel count (for example,
+`_shift_up_10px`), so 5px and 10px variants stay with the same original source.
+Numeric source suffixes remain distinct unless provenance confirms their identity.
 By default, about one sixth of each high/low group is held out for validation.
 
 Preview preprocessing without training:
@@ -145,8 +149,9 @@ python preprocess_ui.py
 The UI can select either an input TIFF folder (searched recursively) or an
 existing source manifest CSV, plus the output folder. Folder mode writes the
 discovered file list to `source_manifest.csv` in the output directory. It also
-exposes the object-size and morphology settings and displays the preprocessing
-log. A representative
+exposes the object-size and morphology settings. Each click launches an
+independent background process, so the UI can be closed and different
+input/output folder pairs can run concurrently. A representative
 multi-layer TIFF can also be selected to compare a raw BF/nucleus/bead
 composite with the final four-channel model input before processing the full
 dataset. The equivalent command-line workflow is:
@@ -163,6 +168,44 @@ python preprocess_dataset.py \
   --nucleus-max-diameter 100 \
   --cell-opening-px 4
 ```
+
+Add `--background` to return immediately while preprocessing continues in a
+detached process:
+
+```bash
+python preprocess_dataset.py \
+  --input-dir data/raw_tiffs_a \
+  --output-dir data/preprocessed_a \
+  --background
+
+python preprocess_dataset.py \
+  --input-dir data/raw_tiffs_b \
+  --output-dir data/preprocessed_b \
+  --background
+```
+
+Each output directory receives `preprocess_progress.json`, `preprocess.log`, and
+a temporary `preprocessing.lock`. Monitor one or several jobs from a terminal:
+
+```bash
+python monitor_preprocessing.py \
+  --output-dir data/preprocessed_a \
+  --output-dir data/preprocessed_b \
+  --watch
+```
+
+The monitor reports PID, current file, processed and cached counts, QC
+exclusions, errors, elapsed time, and ETA. Closing the monitor does not stop the
+background jobs. Two jobs may run simultaneously when they use different
+output directories; the lock prevents accidental concurrent writes to the same
+output directory.
+
+Progress updates are throttled to once per second to avoid sync-client churn.
+TIFF reads and atomic progress, NPZ, QC, and manifest writes automatically retry
+transient filesystem errors such as OneDrive file locks. A temporarily locked
+progress or log file never stops image processing. Re-running the same output
+directory after an interruption reuses every valid four-channel NPZ and only
+processes missing items.
 
 To process every TIFF under a folder without preparing a manifest first:
 
@@ -213,19 +256,46 @@ folder, and file browser. The Manifest Builder page combines completed
 augmented variants by their original source ID, and writes deterministic
 train/validation/test splits.
 
-The Training page uses target, schedule-mode, and model checkboxes. One click
-launches every selected target/model combination sequentially through
-`train_preprocessed_batch.py`, with either model-specific recommended schedules
-or one shared custom schedule.
+Test sets now contain equal numbers of high and low images within each hormone.
+The per-class budget is 15% (or the selected test fraction) of the smaller
+class's image count. Whole source groups, including their augmented variants,
+stay together; the splitter selects the largest achievable equal count at or
+below that budget. Validation groups retain the previous allocation for the
+same dataset, fractions, and seed, and remaining groups go to training.
+An error is reported if no nonempty balanced test set fits the budget.
+Existing CSV splits and completed training runs are unchanged until a new
+manifest is selected or the dataset-root manifest is refreshed.
+The desktop training UI and dashboard default to
+`training_manifest_balanced_test.csv`; the dashboard also uses this name when
+preparing new training manifests. The default test fraction is 0.15.
+
+The Training page accepts either a dataset root or an existing training-manifest
+CSV. Dataset-root mode recognizes the
+`insulin|glucagon/high|low/tensors` layout, rebases copied or stale OneDrive NPZ
+paths to the selected local root, and prepares augmentation-safe
+train/validation/test splits. The workspace default is `data/tensors_0825`.
+After preparing the manifest, one click launches every selected target/model
+combination sequentially through `train_preprocessed_batch.py`, with either
+model-specific recommended schedules or one shared custom schedule.
 
 Training runs publish atomic `progress.json` files and multi-run queues publish
 `*_batch_progress.json`. The Streamlit Training page refreshes every three
 seconds to show queue position, current target/model, epoch and batch progress,
 validation AUROC, best score, ETA, device, job states, and a tail of `train.log`.
+On Windows, progress and checkpoint replacement retries transient file locks;
+an unavailable monitoring JSON is reported as a warning and does not terminate
+model training.
 
-The dashboard Prediction page calls `predict_preprocessed.py`; it reads cached
-NPZ tensors and refuses legacy checkpoints so prediction uses the same frozen
-preprocessing distribution as training.
+Grad-CAM previews use one unaugmented `_orig` image per source group. Rotated,
+flipped, and integer-pixel shifted copies are excluded, and the selected previews alternate high/low
+labels when both classes are available. The QC page also hides augmented
+duplicates from previews saved by older runs.
+
+The dashboard Prediction page accepts the same dataset-root layout or an
+existing prediction manifest. Dataset-root mode writes a local-path
+`prediction_manifest.csv`, then calls `predict_preprocessed.py`. Prediction
+reads cached NPZ tensors and refuses legacy or incomplete checkpoints so it uses
+the same frozen preprocessing distribution as training.
 
 ```bash
 python train_preprocessed.py \

@@ -10,6 +10,7 @@ __pycache__/
 venv/
 env/
 .venv/
+.venv-preprocess/
 .python/
 python-*.exe
 *.sqlite3
@@ -20,6 +21,10 @@ python-*.exe
 data/raw/
 data/
 runs/
+predictions/
 predictions*.csv
+G2_B19_1331_index2_mask_overlay.png
+image-augmentation/
+multilayer-tif-sorter-prototype/
 .matplotlib/
 .streamlit-user/

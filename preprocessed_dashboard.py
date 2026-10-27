@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import os
-import re
 import subprocess
 import sys
 from datetime import datetime
@@ -13,14 +11,21 @@ import pandas as pd
 import streamlit as st
 
 from src.model import MODEL_LABELS, MODEL_NAMES, MODEL_TRAINING_DEFAULTS
+from src.training_manifest import (
+    DEFAULT_TRAINING_MANIFEST_NAME,
+    assign_manifest_splits,
+    build_dataset_root_manifest,
+    is_original_variant,
+    rebase_preprocessed_paths,
+    source_id,
+    write_training_manifest,
+)
 
 
 ROOT = Path(__file__).resolve().parent
 RUNS_DIR = ROOT / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
-AUGMENTATION_SUFFIX_RE = re.compile(
-    r"_(?:orig|rot90|rot180|rot270)(?:_flip_lr)?$"
-)
+DEFAULT_TENSOR_DATASET_ROOT = ROOT / "data" / "tensors_0825"
 
 st.set_page_config(
     page_title="Secretion NPZ Dashboard",
@@ -226,6 +231,18 @@ def tail(path: Path, lines: int = 35) -> str:
         return "Log has not been created yet."
 
 
+def format_duration(value: object) -> str:
+    if value is None:
+        return "-"
+    try:
+        seconds = max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return "-"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def preprocessing_page() -> None:
     st.header("Pre-processing status")
     st.caption(
@@ -244,42 +261,73 @@ def preprocessing_page() -> None:
 
     source_manifest = output / "source_manifest.csv"
     tensors = output / "tensors"
-    total = 0
-    if source_manifest.exists():
+    progress_state = load_json(output / "preprocess_progress.json")
+    total = int(progress_state.get("total", 0) or 0)
+    if not total and source_manifest.exists():
         try:
             total = len(pd.read_csv(source_manifest, usecols=["path"]))
         except Exception:
             total = 0
     npz_files = list(tensors.glob("*.npz")) if tensors.is_dir() else []
     qc_files = list(tensors.glob("*.qc.json")) if tensors.is_dir() else []
-    complete = len(npz_files)
+    complete = int(progress_state.get("completed", len(npz_files)) or 0)
     percent = min(complete / total, 1.0) if total else 0.0
     latest = max((path.stat().st_mtime for path in npz_files), default=0)
     latest_text = (
         datetime.fromtimestamp(latest).strftime("%Y-%m-%d %H:%M:%S")
         if latest else "-"
     )
-    active = bool(latest and datetime.now().timestamp() - latest < 60)
+    status = str(progress_state.get("status", ""))
+    active = status in {"launching", "initializing", "discovering", "running"} or bool(
+        not status and latest and datetime.now().timestamp() - latest < 60
+    )
 
-    cols = st.columns(5)
+    cols = st.columns(6)
     cols[0].metric("Source TIFFs", f"{total:,}" if total else "-")
-    cols[1].metric("NPZ complete", f"{complete:,}")
-    cols[2].metric("QC files", f"{len(qc_files):,}")
+    cols[1].metric("Completed", f"{complete:,}")
+    cols[2].metric("Errors", f"{int(progress_state.get('errors', 0) or 0):,}")
     cols[3].metric("Progress", f"{percent:.1%}" if total else "-")
-    cols[4].metric("Activity", "Running" if active else "Idle / complete")
+    cols[4].metric("Status", status.title() if status else ("Running" if active else "Legacy / idle"))
+    cols[5].metric("ETA", format_duration(progress_state.get("eta_seconds")))
     if total:
         st.progress(percent, text=f"{complete:,} / {total:,} images")
-    st.caption(f"Latest tensor update: {latest_text}")
+    detail_cols = st.columns(4)
+    detail_cols[0].metric("Newly processed", f"{int(progress_state.get('processed', 0) or 0):,}")
+    detail_cols[1].metric("Reused cache", f"{int(progress_state.get('cached', 0) or 0):,}")
+    detail_cols[2].metric("Trainable", f"{int(progress_state.get('ok', 0) or 0):,}")
+    detail_cols[3].metric("Excluded QC", f"{int(progress_state.get('excluded_qc', 0) or 0):,}")
+    if progress_state.get("current_file"):
+        st.caption(f"Current file: `{progress_state['current_file']}`")
+    st.caption(
+        f"PID: {progress_state.get('pid', '-')} | "
+        f"Elapsed: {format_duration(progress_state.get('elapsed_seconds'))} | "
+        f"Latest tensor update: {latest_text}"
+    )
+    if progress_state.get("last_error"):
+        st.warning(f"Latest error: {progress_state['last_error']}")
+    if int(progress_state.get("progress_write_failures", 0) or 0):
+        st.caption(
+            "Transient progress-file conflicts recovered: "
+            f"{int(progress_state['progress_write_failures']):,}"
+        )
     if st.button("Refresh status"):
         st.rerun()
+
+    with st.expander("Pre-processing log", expanded=status == "failed"):
+        st.code(tail(output / "preprocess.log", 50), language="text")
 
     config = load_json(output / "preprocess_run_config.json")
     if config:
         with st.expander("Pre-processing configuration"):
             st.json(config)
 
-    final_report = output / "preprocess_qc_all.csv"
-    if final_report.exists():
+    reported_qc_path = progress_state.get("qc_report")
+    final_report = (
+        Path(str(reported_qc_path))
+        if reported_qc_path
+        else output / "preprocess_qc_all.csv"
+    )
+    if final_report.exists() and status not in {"failed", "cancelled"} and not active:
         qc = pd.read_csv(final_report)
         st.success("Pre-processing completed and the final QC report is available.")
         status_counts = qc.get(
@@ -302,69 +350,20 @@ def preprocessing_page() -> None:
             st.subheader("QC distribution")
             st.dataframe(qc[numeric].describe().T, use_container_width=True)
         st.dataframe(qc.head(200), use_container_width=True, hide_index=True)
+    elif active:
+        st.info(
+            "Background preprocessing is running. Final manifest and QC report are "
+            "published atomically after all TIFFs finish."
+        )
+    elif status in {"failed", "cancelled"}:
+        st.error(
+            "This preprocessing job did not complete. Check the latest error and "
+            "preprocess.log above. Any existing final report may belong to an older run."
+        )
     else:
         st.info(
             "The final QC report and preprocessed manifest are written after all TIFFs finish."
         )
-
-
-def source_id(path: str) -> str:
-    return AUGMENTATION_SUFFIX_RE.sub("", Path(path).stem)
-
-
-def assign_manifest_splits(
-    dataframe: pd.DataFrame,
-    validation_fraction: float,
-    test_fraction: float,
-    seed: int,
-) -> pd.DataFrame:
-    """Assign augmented source groups to deterministic, leakage-free splits."""
-    assignments: list[dict[str, str]] = []
-    groups = dataframe[["hormone", "label", "source_id"]].drop_duplicates()
-    for (hormone, label), group in groups.groupby(["hormone", "label"]):
-        identifiers = group["source_id"].astype(str).tolist()
-        identifiers.sort(
-            key=lambda item: hashlib.sha1(
-                f"{seed}:{hormone}:{label}:{item}".encode("utf-8")
-            ).hexdigest()
-        )
-        count = len(identifiers)
-        if count < 3:
-            raise ValueError(
-                f"{hormone}/{label} needs at least 3 independent source groups; found {count}."
-            )
-        test_count = max(1, int(round(count * test_fraction)))
-        validation_count = max(1, int(round(count * validation_fraction)))
-        while test_count + validation_count >= count:
-            if test_count >= validation_count and test_count > 1:
-                test_count -= 1
-            elif validation_count > 1:
-                validation_count -= 1
-            else:
-                raise ValueError(
-                    f"Cannot create train/val/test splits for {hormone}/{label}."
-                )
-        for index, identifier in enumerate(identifiers):
-            split = (
-                "test" if index < test_count
-                else "val" if index < test_count + validation_count
-                else "train"
-            )
-            assignments.append(
-                {
-                    "hormone": str(hormone),
-                    "label": str(label),
-                    "source_id": identifier,
-                    "split": split,
-                }
-            )
-    assignment_df = pd.DataFrame(assignments)
-    return dataframe.drop(columns=["split"], errors="ignore").merge(
-        assignment_df,
-        on=["hormone", "label", "source_id"],
-        how="left",
-        validate="many_to_one",
-    )
 
 
 def _apply_dataset_root(root_text: str) -> None:
@@ -386,7 +385,7 @@ def manifest_builder_page() -> None:
         "Preprocessed dataset root",
         "manifest_dataset_root",
         kind="folder",
-        default=str(ROOT / "data" / "preprocessed_dataset"),
+        default=str(DEFAULT_TENSOR_DATASET_ROOT),
     )
     st.button(
         "Apply root as insulin/high, insulin/low, glucagon/high, glucagon/low",
@@ -420,7 +419,7 @@ def manifest_builder_page() -> None:
         default=dataset_root_text,
     )
     output_name = st.text_input(
-        "Manifest filename", value="training_manifest.csv"
+        "Manifest filename", value=DEFAULT_TRAINING_MANIFEST_NAME
     ).strip()
     c1, c2, c3 = st.columns(3)
     validation_fraction = float(
@@ -430,6 +429,11 @@ def manifest_builder_page() -> None:
         c2.number_input("Test fraction", 0.01, 0.45, 0.15, 0.01)
     )
     seed = int(c3.number_input("Split seed", 0, 1_000_000, 17))
+    st.caption(
+        "Test uses equal high/low image counts per hormone, based on the smaller "
+        "class × test fraction. Whole source groups stay together, so counts may "
+        "round down. Validation is retained; remaining groups go to training."
+    )
 
     rows = []
     status_rows = []
@@ -461,6 +465,12 @@ def manifest_builder_page() -> None:
             )
             continue
         category = category.copy()
+        category, missing_npz = rebase_preprocessed_paths(category, folder)
+        if missing_npz:
+            errors.append(
+                f"{hormone}/{label}: {len(missing_npz):,} NPZ files are missing "
+                "from the selected local tensors folder."
+            )
         category["hormone"] = hormone
         category["label"] = label
         category["source_id"] = category["path"].astype(str).map(source_id)
@@ -701,39 +711,191 @@ def live_training_status() -> None:
     training_status()
 
 
+def dataset_root_fingerprint(root: Path) -> tuple[tuple[str, int, int], ...]:
+    """Track source-manifest and tensor-folder changes for Streamlit caching."""
+    values = []
+    for hormone in ("insulin", "glucagon"):
+        for label in ("high", "low"):
+            for path in (
+                root / hormone / label / "preprocessed_manifest.csv",
+                root / hormone / label / "tensors",
+            ):
+                try:
+                    stat = path.stat()
+                    values.append((str(path), stat.st_mtime_ns, stat.st_size))
+                except OSError:
+                    values.append((str(path), 0, 0))
+    return tuple(values)
+
+
+@st.cache_data(show_spinner=False)
+def cached_dataset_root_manifest(
+    root_text: str,
+    validation_fraction: float,
+    test_fraction: float,
+    seed: int,
+    fingerprint: tuple[tuple[str, int, int], ...],
+) -> tuple[pd.DataFrame | None, pd.DataFrame, list[str]]:
+    """Cache balanced-test manifests with rotations, flips and any integer-pixel shifts grouped."""
+    del fingerprint  # Its value invalidates the cache when the dataset changes.
+    return build_dataset_root_manifest(
+        root_text,
+        validation_fraction=validation_fraction,
+        test_fraction=test_fraction,
+        seed=seed,
+    )
+
+
+def generated_manifest_matches(
+    existing: pd.DataFrame,
+    generated: pd.DataFrame,
+) -> bool:
+    comparison_columns = [
+        "preprocessed_path", "hormone", "label", "source_id", "split"
+    ]
+    if any(column not in existing.columns for column in comparison_columns):
+        return False
+    left = existing[comparison_columns].fillna("").astype(str).reset_index(drop=True)
+    right = generated[comparison_columns].fillna("").astype(str).reset_index(drop=True)
+    return left.equals(right)
+
+
 def training_page() -> None:
     st.header("Independent NPZ training")
     st.success(
         "Every command launched here uses --preprocessed. Source TIFF files are not opened."
     )
-    manifest_text = path_browser(
-        "preprocessed_manifest.csv",
-        "training_manifest",
-        kind="file",
-        extensions=(".csv",),
+    st.subheader("1. Training data input")
+    input_mode = st.radio(
+        "Input type",
+        ("Dataset folder (recommended)", "Existing training manifest CSV"),
+        horizontal=True,
+        help=(
+            "Dataset folder mode recognizes the insulin/high, insulin/low, "
+            "glucagon/high, and glucagon/low layout and fixes copied OneDrive paths."
+        ),
     )
-    manifest = Path(manifest_text).expanduser() if manifest_text else Path()
-    df, errors = (
-        manifest_report(manifest) if manifest_text
-        else (None, ["Select a completed training manifest."])
-    )
+    manifest = Path()
+    df: pd.DataFrame | None = None
+    errors: list[str] = []
+    generated: pd.DataFrame | None = None
+
+    if input_mode == "Dataset folder (recommended)":
+        dataset_root_text = path_browser(
+            "4-channel tensor dataset root",
+            "training_dataset_root",
+            kind="folder",
+            default=str(DEFAULT_TENSOR_DATASET_ROOT),
+        )
+        dataset_root = Path(dataset_root_text).expanduser()
+        split1, split2, split3 = st.columns(3)
+        validation_fraction = float(
+            split1.number_input(
+                "Validation fraction", 0.01, 0.45, 0.15, 0.01,
+                key="training_root_validation_fraction",
+            )
+        )
+        test_fraction = float(
+            split2.number_input(
+                "Test fraction", 0.01, 0.45, 0.15, 0.01,
+                key="training_root_test_fraction",
+            )
+        )
+        split_seed = int(
+            split3.number_input(
+                "Split seed", 0, 1_000_000, 17,
+                key="training_root_split_seed",
+            )
+        )
+        fingerprint = dataset_root_fingerprint(dataset_root)
+        st.caption(
+            "Test uses equal high/low image counts per hormone, based on the smaller "
+            "class × test fraction. Counts round down when needed to keep source "
+            "groups together. Validation is retained; remaining groups go to training."
+        )
+        with st.spinner("Checking local manifests and NPZ tensors..."):
+            generated, dataset_status, dataset_errors = cached_dataset_root_manifest(
+                str(dataset_root),
+                validation_fraction,
+                test_fraction,
+                split_seed,
+                fingerprint,
+            )
+        if not dataset_status.empty:
+            st.dataframe(dataset_status, use_container_width=True, hide_index=True)
+        errors.extend(dataset_errors)
+
+        manifest = dataset_root / DEFAULT_TRAINING_MANIFEST_NAME
+        st.caption(
+            "Generated manifest: " + str(manifest) +
+            " — NPZ paths are rebased to this local dataset folder."
+        )
+        if st.button(
+            "Prepare / refresh training manifest",
+            type="primary",
+            disabled=generated is None or bool(dataset_errors),
+        ):
+            try:
+                manifest = write_training_manifest(generated, manifest)
+                st.session_state["training_manifest_typed"] = str(manifest)
+                st.success(
+                    f"Prepared {len(generated):,} local 4-channel tensor rows: {manifest}"
+                )
+            except Exception as error:
+                errors.append(f"Cannot write training manifest: {error}")
+
+        if manifest.is_file():
+            df, manifest_errors = manifest_report(manifest)
+            errors.extend(manifest_errors)
+            if (
+                df is not None
+                and generated is not None
+                and not generated_manifest_matches(df, generated)
+            ):
+                errors.append(
+                    "The saved training manifest does not match the selected dataset "
+                    "or split settings. Click 'Prepare / refresh training manifest'."
+                )
+        else:
+            errors.append(
+                "Click 'Prepare / refresh training manifest' once before starting training."
+            )
+    else:
+        manifest_text = path_browser(
+            "Training manifest CSV",
+            "training_manifest",
+            kind="file",
+            default=str(DEFAULT_TENSOR_DATASET_ROOT / DEFAULT_TRAINING_MANIFEST_NAME),
+            extensions=(".csv",),
+        )
+        manifest = Path(manifest_text).expanduser() if manifest_text else Path()
+        df, manifest_errors = (
+            manifest_report(manifest) if manifest_text
+            else (None, ["Select a completed training manifest."])
+        )
+        errors.extend(manifest_errors)
+
     if df is not None:
         missing_npz = (
             sum(not Path(str(path)).is_file() for path in df["preprocessed_path"])
             if "preprocessed_path" in df else len(df)
         )
-        split_counts = df.get("split", pd.Series(dtype=str)).value_counts().to_dict()
-        c1, c2, c3, c4 = st.columns(4)
+        split_counts = (
+            df.get("split", pd.Series(dtype=str))
+            .astype(str).str.lower().value_counts().to_dict()
+        )
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Rows", f"{len(df):,}")
         c2.metric("Train", f"{split_counts.get('train', 0):,}")
         c3.metric("Validation", f"{split_counts.get('val', 0):,}")
-        c4.metric("Missing NPZ", f"{missing_npz:,}")
+        c4.metric("Test", f"{split_counts.get('test', 0):,}")
+        c5.metric("Missing NPZ", f"{missing_npz:,}")
         if missing_npz:
             errors.append(f"{missing_npz:,} NPZ files are missing.")
-    for error in errors:
+    for error in dict.fromkeys(errors):
         st.warning(error)
 
-    st.subheader("1. Targets")
+    st.subheader("2. Targets")
     target_columns = st.columns(2)
     selected_targets = []
     if target_columns[0].checkbox("Insulin", value=True, key="train_target_insulin"):
@@ -741,7 +903,7 @@ def training_page() -> None:
     if target_columns[1].checkbox("Glucagon", value=True, key="train_target_glucagon"):
         selected_targets.append("glucagon")
 
-    st.subheader("2. Training mode")
+    st.subheader("3. Training mode")
     mode_columns = st.columns(2)
     recommended_mode = mode_columns[0].checkbox(
         "Recommended schedule per model",
@@ -758,7 +920,7 @@ def training_page() -> None:
         st.error("Select exactly one training mode.")
     schedule = "recommended" if recommended_mode else "custom"
 
-    st.subheader("3. Models")
+    st.subheader("4. Models")
     model_columns = st.columns(len(MODEL_NAMES))
     selected_models = []
     for index, model_name in enumerate(MODEL_NAMES):
@@ -774,7 +936,7 @@ def training_page() -> None:
     ).strip()
 
     defaults = MODEL_TRAINING_DEFAULTS["resnet18"]
-    st.subheader("4. Schedule and output settings")
+    st.subheader("5. Schedule and output settings")
     s1, s2, s3, s4 = st.columns(4)
     epochs = int(
         s1.number_input(
@@ -819,7 +981,18 @@ def training_page() -> None:
         a2.number_input("Weight decay", 0.0, 1.0, 0.0001, format="%.6f")
     )
     workers = int(a3.number_input("Workers", 0, 32, 0))
-    preview_images = int(a4.number_input("Grad-CAM previews", 0, 500, 25))
+    preview_images = int(
+        a4.number_input(
+            "Grad-CAM previews",
+            0,
+            500,
+            25,
+            help=(
+                "Maximum number of unique, non-augmented source images. "
+                "Rotated/flipped copies are excluded and high/low examples are balanced."
+            ),
+        )
+    )
     pretrained = st.checkbox("Use ImageNet pretrained weights", value=False)
 
     combination_count = len(selected_targets) * len(selected_models)
@@ -1067,7 +1240,16 @@ def qc_focus_page() -> None:
             "to at least 1 when starting a new training run. The dashboard default is 25."
         )
         return
-    examples = pd.read_csv(examples_csv)
+    saved_examples = pd.read_csv(examples_csv)
+    original_examples = saved_examples[
+        saved_examples["path"].astype(str).map(is_original_variant)
+    ].copy()
+    if "source_id" not in original_examples.columns:
+        original_examples["source_id"] = original_examples["path"].astype(str).map(
+            source_id
+        )
+    original_examples = original_examples.drop_duplicates("source_id", keep="first")
+    examples = original_examples.copy()
     c1, c2, c3 = st.columns(3)
     filter_mode = c1.radio(
         "Filter",
@@ -1097,15 +1279,15 @@ def qc_focus_page() -> None:
         )
         examples = examples[confidence >= probability_min]
 
-    total = len(pd.read_csv(examples_csv))
+    total = len(original_examples)
     wrong = int(
         (
-            pd.read_csv(examples_csv)["label"].astype(str)
-            != pd.read_csv(examples_csv)["predicted_label"].astype(str)
+            original_examples["label"].astype(str)
+            != original_examples["predicted_label"].astype(str)
         ).sum()
     )
     metrics = st.columns(3)
-    metrics[0].metric("Saved previews", f"{total:,}")
+    metrics[0].metric("Unique original previews", f"{total:,}")
     metrics[1].metric("Misclassified", f"{wrong:,}")
     metrics[2].metric("Displayed", f"{min(len(examples), page_size):,}")
     st.dataframe(examples.head(200), use_container_width=True, hide_index=True)
@@ -1129,6 +1311,9 @@ def checkpoint_runs(target: str) -> list[Path]:
     candidates = []
     for directory in run_dirs():
         if not (directory / "best_model.pt").exists():
+            continue
+        progress = load_json(directory / "progress.json")
+        if progress.get("status") != "complete":
             continue
         config = load_json(directory / "run_config.json")
         if not config.get("preprocessed", False):
@@ -1154,40 +1339,118 @@ def prediction_page() -> None:
         "Prediction reads preprocessed_path tensors only and rejects checkpoints "
         "that were trained with the legacy TIFF-on-the-fly workflow."
     )
-    manifest_text = path_browser(
-        "Prediction manifest CSV",
-        "prediction_manifest",
-        kind="file",
-        extensions=(".csv",),
+    st.subheader("1. Prediction data input")
+    input_mode = st.radio(
+        "Input type",
+        ("Dataset folder (recommended)", "Existing prediction manifest CSV"),
+        horizontal=True,
+        key="prediction_input_mode",
+        help=(
+            "Dataset folder mode recognizes the insulin/high, insulin/low, "
+            "glucagon/high, and glucagon/low layout and replaces copied OneDrive "
+            "paths with local NPZ paths."
+        ),
     )
-    manifest = Path(manifest_text).expanduser() if manifest_text else Path()
-    prediction_df = None
+    manifest = Path()
+    prediction_df: pd.DataFrame | None = None
     manifest_error = ""
-    if manifest_text:
-        try:
-            prediction_df = pd.read_csv(manifest)
-            if "preprocessed_path" not in prediction_df:
-                manifest_error = "Manifest must contain preprocessed_path."
-            else:
-                missing = sum(
-                    not Path(str(path)).is_file()
-                    for path in prediction_df["preprocessed_path"]
+
+    if input_mode == "Dataset folder (recommended)":
+        dataset_root_text = path_browser(
+            "4-channel tensor dataset root",
+            "prediction_dataset_root",
+            kind="folder",
+            default=str(DEFAULT_TENSOR_DATASET_ROOT),
+        )
+        dataset_root = Path(dataset_root_text).expanduser()
+        fingerprint = dataset_root_fingerprint(dataset_root)
+        with st.spinner("Checking local manifests and NPZ tensors..."):
+            generated, dataset_status, dataset_errors = cached_dataset_root_manifest(
+                str(dataset_root),
+                0.15,
+                0.15,
+                17,
+                fingerprint,
+            )
+        if not dataset_status.empty:
+            st.dataframe(dataset_status, use_container_width=True, hide_index=True)
+        manifest = dataset_root / "prediction_manifest.csv"
+        st.caption(
+            "Generated manifest: " + str(manifest) +
+            " — all NPZ paths are rebased to this local dataset folder."
+        )
+        if st.button(
+            "Prepare / refresh prediction manifest",
+            type="primary",
+            disabled=generated is None or bool(dataset_errors),
+        ):
+            try:
+                manifest = write_training_manifest(generated, manifest)
+                st.session_state["prediction_manifest_typed"] = str(manifest)
+                st.success(
+                    f"Prepared {len(generated):,} local 4-channel tensor rows: "
+                    f"{manifest}"
                 )
-                columns = st.columns(3)
-                columns[0].metric("Rows", f"{len(prediction_df):,}")
-                columns[1].metric("Missing NPZ", f"{missing:,}")
-                columns[2].metric(
-                    "Labeled", "Yes" if "label" in prediction_df else "No"
-                )
-                if missing:
-                    manifest_error = f"{missing:,} referenced NPZ files are missing."
-        except Exception as error:
-            manifest_error = str(error)
+            except Exception as error:
+                dataset_errors.append(f"Cannot write prediction manifest: {error}")
+
+        if dataset_errors:
+            manifest_error = " | ".join(dict.fromkeys(dataset_errors))
+        elif manifest.is_file():
+            try:
+                prediction_df = pd.read_csv(manifest)
+                if generated is not None and not generated_manifest_matches(
+                    prediction_df, generated
+                ):
+                    manifest_error = (
+                        "The saved prediction manifest does not match the selected "
+                        "dataset. Click 'Prepare / refresh prediction manifest'."
+                    )
+            except Exception as error:
+                manifest_error = str(error)
+        else:
+            manifest_error = (
+                "Click 'Prepare / refresh prediction manifest' once before prediction."
+            )
     else:
-        manifest_error = "Select a preprocessed manifest."
+        manifest_text = path_browser(
+            "Prediction manifest CSV",
+            "prediction_manifest",
+            kind="file",
+            default=str(DEFAULT_TENSOR_DATASET_ROOT / "prediction_manifest.csv"),
+            extensions=(".csv",),
+        )
+        manifest = Path(manifest_text).expanduser() if manifest_text else Path()
+        if manifest_text:
+            try:
+                prediction_df = pd.read_csv(manifest)
+            except Exception as error:
+                manifest_error = str(error)
+        else:
+            manifest_error = "Select a prediction manifest."
+
+    if prediction_df is not None and not manifest_error:
+        if "preprocessed_path" not in prediction_df:
+            manifest_error = "Manifest must contain preprocessed_path."
+        else:
+            missing = sum(
+                not Path(str(path)).is_file()
+                for path in prediction_df["preprocessed_path"]
+            )
+            columns = st.columns(5)
+            columns[0].metric("Rows", f"{len(prediction_df):,}")
+            columns[1].metric("Insulin", f"{int((prediction_df.get('hormone', pd.Series(dtype=str)).astype(str).str.lower() == 'insulin').sum()):,}")
+            columns[2].metric("Glucagon", f"{int((prediction_df.get('hormone', pd.Series(dtype=str)).astype(str).str.lower() == 'glucagon').sum()):,}")
+            columns[3].metric("Missing NPZ", f"{missing:,}")
+            columns[4].metric(
+                "Labeled", "Yes" if "label" in prediction_df else "No"
+            )
+            if missing:
+                manifest_error = f"{missing:,} referenced NPZ files are missing."
     if manifest_error:
         st.warning(manifest_error)
 
+    st.subheader("2. Completed model checkpoints")
     selected_checkpoints: dict[str, Path] = {}
     checkpoint_columns = st.columns(2)
     for column, target in zip(checkpoint_columns, ("insulin", "glucagon")):
@@ -1208,6 +1471,7 @@ def prediction_page() -> None:
             if use_model and selected:
                 selected_checkpoints[target] = selected / "best_model.pt"
 
+    st.subheader("3. Prediction output")
     output_folder_text = path_browser(
         "Prediction output folder",
         "prediction_output_folder",
@@ -1288,6 +1552,7 @@ def main() -> None:
             "QC / Model Focus",
             "Prediction",
         ),
+        index=2,
     )
     if page == "Pre-processing":
         preprocessing_page()

@@ -2,24 +2,29 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 from src.model import MODEL_NAMES, MODEL_TRAINING_DEFAULTS
+from src.resilient_io import write_json_atomic
 
 
 def write_progress(path: Path, payload: dict[str, object]) -> None:
-    payload = {
-        **payload,
-        "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    """Publish queue state without letting a dashboard file lock stop training."""
+    try:
+        write_json_atomic(path, payload, attempts=12)
+    except OSError as error:
+        failures = int(payload.get("progress_write_failures", 0) or 0) + 1
+        payload["progress_write_failures"] = failures
+        payload["last_progress_write_error"] = str(error)
+        if failures == 1 or failures % 10 == 0:
+            print(
+                "WARNING: batch progress file is temporarily locked; the training "
+                f"queue will continue and retry on the next update: {error}",
+                flush=True,
+            )
 
 
 def parse_args() -> argparse.Namespace:
